@@ -1,5 +1,35 @@
 #include "hijack.h"
 
+enum {
+   BUTTON_ERROR,
+   BUTTON_PRESSED,
+   BUTTON_TIMEOUT,
+};
+
+/* Main menu items */
+#define ITEM_REBOOT      0
+#define ITEM_CONTINUE    1
+#define ITEM_OVERCLOCK   2
+#define ITEM_RECOVERY    3
+#define ITEM_TOOLS       4
+#define ITEM_FIXES       5
+#define ITEM_POWEROFF    6
+
+#define ITEM_LAST        6
+
+char* MENU_ITEMS[] = {
+    "  [Reboot]",
+    "  [Continue Boot]",
+    "  +CPU Settings -->",
+    "  +Recovery -->",
+    "  +Tools -->",
+    "  +Fixes -->",
+    "  [Shutdown]",
+    NULL
+};
+
+static char** main_headers = NULL;
+
 int exec_and_wait(char ** argp)
 {
     pid_t pid;
@@ -27,6 +57,16 @@ int exec_and_wait(char ** argp)
     (void)bsd_signal(SIGINT, intsave);
     (void)bsd_signal(SIGQUIT, quitsave);
     return (pid == -1 ? -1 : pstat);
+}
+
+int exec_script(char * hijack_exec, char * script) {
+     char * placeholder[2];
+
+     //placeholder[0] = hijack_exec;
+     placeholder[0] = script;
+     placeholder[1] = NULL;
+
+     return exec_and_wait(placeholder);
 }
 
 int remount_root(const char * hijack_exec, int rw) {
@@ -107,6 +147,204 @@ int mark_file(char * filename) {
     }
 }
 
+char** prepend_title(const char** headers) {
+
+  char* title[] = {
+      "Android Bootmenu <v"
+      EXPAND(BOOTMENU_VERSION) ">",
+      "",
+      NULL
+  };
+
+  // count the number of lines in our title, plus the
+  // caller-provided headers.
+  int count = 0;
+  char** p;
+  for (p = title; *p; ++p, ++count);
+  for (p = (char**) headers; *p; ++p, ++count);
+
+  char** new_headers = malloc((count+1) * sizeof(char*));
+  char** h = new_headers;
+  for (p = title; *p; ++p, ++h) *h = *p;
+  for (p = (char**) headers; *p; ++p, ++h) *h = *p;
+  *h = NULL;
+
+  return new_headers;
+}
+
+void free_menu_headers(char **headers) {
+  char** p = headers;
+  for (p = headers; *p; ++p) *p = NULL;
+  if (headers != NULL) {
+    free(headers);
+    headers = NULL;
+  }
+}
+
+int get_menu_selection(char** headers, char** items, int menu_only,
+                       int initial_selection) {
+  // throw away keys pressed previously, so user doesn't
+  // accidentally trigger menu items.
+  ui_clear_key_queue();
+
+  ui_start_menu(headers, items, initial_selection);
+  int selected = initial_selection;
+  int chosen_item = -1;
+
+  while (chosen_item < 0) {
+    int key = ui_wait_key();
+    int visible = ui_text_visible();
+
+    int action = device_handle_key(key, visible);
+
+      if (action < 0) {
+        switch (action) {
+          case HIGHLIGHT_UP:
+            --selected;
+            selected = ui_menu_select(selected);
+            break;
+          case HIGHLIGHT_DOWN:
+            ++selected;
+            selected = ui_menu_select(selected);
+            break;
+          case SELECT_ITEM:
+            chosen_item = selected;
+            break;
+          case ACTION_CANCEL:
+            chosen_item = GO_BACK;
+            break;
+          case NO_ACTION:
+            break;
+      }
+    } else if (!menu_only) {
+      chosen_item = action;
+    }
+  }
+
+  ui_end_menu();
+  return chosen_item;
+}
+
+static void prompt_and_wait() {
+
+  int select = 0;
+
+  for (;;) {
+    ui_reset_progress();
+    int chosen_item = get_menu_selection(main_headers, MENU_ITEMS, 1, select);
+
+    if (chosen_item >= 0 && chosen_item <= ITEM_LAST) {
+
+      switch (chosen_item) {
+      case ITEM_REBOOT:
+        sync();
+        reboot(RB_AUTOBOOT);
+        return;
+      case ITEM_CONTINUE:
+        return;
+      case ITEM_OVERCLOCK:
+        if (show_menu_overclock()) return;
+        break;
+      case ITEM_RECOVERY:
+        if (show_menu_recovery()) return;
+        break;
+      case ITEM_TOOLS:
+        if (show_menu_tools()) return;
+        break;
+      case ITEM_FIXES:
+        if (show_menu_fixes()) return;
+        break;
+      case ITEM_POWEROFF:
+        sync();
+        __reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_POWER_OFF, NULL);
+        return;
+      }
+
+      select = chosen_item;
+    }
+  }
+}
+
+static int wait_key(int key) {
+  int i;
+  int result = 0;
+
+  evt_init();
+  //ui_clear_key_queue();
+  for(i=0; i < 100; i++) {
+    if(ui_key_pressed(key)) {
+      led_alert("blue", DISABLE);
+      result = 1;
+      break;
+    }
+    else {
+      usleep(15000); //15ms * 100
+    }
+  }
+  evt_exit();
+  return result;
+}
+
+static void ui_finish(void) {
+  ui_final();
+}
+
+int run_bootmenu(void) {
+    int status = BUTTON_ERROR;
+    int adb_started = 0;
+    int mode;
+    time_t start = time(NULL);
+    struct stat info;
+
+    exec_script("/system/bin/hijack", FILE_PRE_MENU);
+
+    led_alert("blue", ENABLE);
+
+    if (0 == stat(BOOTMODE_CONFIG_FILE, &info)) {
+       hijack_log("BOOTMENU DIRECT BOOT DETECTED");
+       status = BUTTON_PRESSED;
+       led_alert("blue", DISABLE);
+        // dont wait if these modes are asked
+    } else {
+       status = (wait_key(KEY_VOLUMEDOWN) ? BUTTON_PRESSED : BUTTON_TIMEOUT);
+    }
+
+    if (usb_connected()) {
+        exec_script("/system/bin/hijack", FILE_ADBD);
+        adb_started = 1;
+    }
+
+    // on timeout
+    if (status != BUTTON_PRESSED) {
+       led_alert("blue", DISABLE);
+       return 0;
+    }
+
+    if (0 == stat(BOOTMODE_CONFIG_FILE, &info)) {
+       remove(BOOTMODE_CONFIG_FILE);
+    }
+
+    if (status == BUTTON_PRESSED ) {
+        ui_init();
+        ui_set_background(BACKGROUND_DEFAULT);
+        ui_show_text(ENABLE);
+
+        main_headers = prepend_title((const char**)MENU_HEADERS);
+
+        checkup_report();
+
+        //Battery display does not work atm
+        //ui_print("Battery level: %d %%\n", battery_level());
+
+        prompt_and_wait();
+        free_menu_headers(main_headers);
+
+        ui_finish();
+    }
+
+    return EXIT_SUCCESS;
+}
+
 int main(int argc, char ** argv) {
     char * hijacked_executable = argv[0];
     struct stat info;
@@ -114,6 +352,7 @@ int main(int argc, char ** argv) {
     int i;
 
     if (NULL != strstr(hijacked_executable, "hijack")) {
+        hijack_log("****EXITING FROM HIJACK IMMEDIATELY***");
         // no op
         if (argc >= 2) {
             return busybox_driver(argc - 1, argv + 1);
@@ -121,6 +360,15 @@ int main(int argc, char ** argv) {
 
         return 0;
     }
+
+    hijack_log("************ENTERING BOOTMENU**************");
+    hijack_mount("/system/bin/hijack", "/dev/block/mmcblk1p24", "/data");
+    result = hijack_mount("/system/bin/hijack", "/dev/block/preinstall", "/preinstall");
+    result = run_bootmenu();
+    hijack_log(" Bootmenu ran and returned a %d", result);
+    result = exec_script("/system/bin/hijack", FILE_OVERCLOCK);
+    hijack_log("***OVERCLOCK SCRIPT RETURNED A %d******", result);
+    hijack_log("************EXITING BOOTMENU****************");
 
 #ifdef LOG_ENABLE
     // SCREW THE RULES, IF WE GET HERE WE'RE HIJACKING, AND FROM HERE ON OUT
@@ -132,190 +380,187 @@ int main(int argc, char ** argv) {
     hijack_mount("/system/bin/hijack", LOG_DEVICE, LOG_MOUNT);
 
     // time to create our log file and jam our header into it!
-hijack_log("Hijack called with the following arguments:");
+    hijack_log("Hijack called with the following arguments:");
     for (i = 0; i < argc; i++) {
-hijack_log("    argv[%d] = \"%s\"", i, argv[i]);
+    hijack_log("    argv[%d] = \"%s\"", i, argv[i]);
     }
 
-hijack_log("  Executing log dumper script:");
+    hijack_log("  Executing log dumper script:");
     char * log_dump_args[] = { LOG_DUMP_BINARY, LOG_PATH, NULL };
-hijack_log("    exec(\"%s %s\") executing...", LOG_DUMP_BINARY, LOG_PATH);
+    hijack_log("    exec(\"%s %s\") executing...", LOG_DUMP_BINARY, LOG_PATH);
     result = exec_and_wait(log_dump_args);
-hijack_log("      returned: %d", result);
+    hijack_log("      returned: %d", result);
 #endif
 
     // check to see if hijack was already run, and if so, just continue on.
     if (argc >= 3 && 0 == strcmp(argv[2], "userdata")) {
 
-hijack_log("  Entering testing for hijacking!");
+        hijack_log("  Entering testing for hijacking!");
 
-hijack_log("    hijack_mount(%s, %s, %s) executing...", "/system/bin/hijack", "/dev/block/userdata", "/data");
-            result = hijack_mount("/system/bin/hijack", "/dev/block/userdata", "/data");
-hijack_log("      returned: %d", result);
+        hijack_log("    hijack_mount(%s, %s, %s) executing...", "/system/bin/hijack", "/dev/block/userdata", "/data");
+        result = hijack_mount("/system/bin/hijack", "/dev/block/mmcblk1p24", "/data");
+        hijack_log("      returned: %d", result);
 
         if (0 == stat(RECOVERY_MODE_FILE, &info)) {
 
-hijack_log("  Recovery mode detected!");
+            hijack_log("  Recovery mode detected!");
 
             // don't boot into recovery again
-hijack_log("    remove(%s) executing...", RECOVERY_MODE_FILE);
+            hijack_log("    remove(%s) executing...", RECOVERY_MODE_FILE);
             result = remove(RECOVERY_MODE_FILE);
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
-hijack_log("    remount_root(%s, %d) executing...", "/system/bin/hijack", 1);
+            hijack_log("    remount_root(%s, %d) executing...", "/system/bin/hijack", 1);
             result = remount_root("/system/bin/hijack", 1);
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
-hijack_log("    mkdir(%s, %d) executing...", "/preinstall", S_IRWXU);
+            hijack_log("    mkdir(%s, %d) executing...", "/preinstall", S_IRWXU);
             result = mkdir("/preinstall", S_IRWXU);
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
-hijack_log("    mkdir(%s, %d) executing...", "/tmp", S_IRWXU);
+            hijack_log("    mkdir(%s, %d) executing...", "/tmp", S_IRWXU);
             result = mkdir("/tmp", S_IRWXU);
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
-hijack_log("    mkdir(%s, %d) executing...", "/res", S_IRWXU);
+            hijack_log("    mkdir(%s, %d) executing...", "/res", S_IRWXU);
             result = mkdir("/res", S_IRWXU);
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
-hijack_log("    mkdir(%s, %d) executing...", "/res/images", S_IRWXU);
+            hijack_log("    mkdir(%s, %d) executing...", "/res/images", S_IRWXU);
             result = mkdir("/res/images", S_IRWXU);
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
-hijack_log("    remove(%s) executing...", "/etc");
+            hijack_log("    remove(%s) executing...", "/etc");
             result = remove("/etc");
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
-hijack_log("    mkdir(%s, %d) executing...", "/etc", S_IRWXU);
+            hijack_log("    mkdir(%s, %d) executing...", "/etc", S_IRWXU);
             result = mkdir("/etc", S_IRWXU);
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
-hijack_log("    rename(%s, %s) executing...", "/sbin/adbd", "/sbin/adbd.old");
+            hijack_log("    rename(%s, %s) executing...", "/sbin/adbd", "/sbin/adbd.old");
             result = rename("/sbin/adbd", "/sbin/adbd.old");
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
-hijack_log("    property_set(%s, %s) executing...", "ctl.stop", "runtime");
+            hijack_log("    property_set(%s, %s) executing...", "ctl.stop", "runtime");
             result = property_set("ctl.stop", "runtime");
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
-hijack_log("    property_set(%s, %s) executing...", "ctl.stop", "zygote");
+            hijack_log("    property_set(%s, %s) executing...", "ctl.stop", "zygote");
             result = property_set("ctl.stop", "zygote");
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
-hijack_log("    property_set(%s, %s) executing...", "persist.service.adb.enable", "1");
+            hijack_log("    property_set(%s, %s) executing...", "persist.service.adb.enable", "1");
             result = property_set("persist.service.adb.enable", "1");
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
-hijack_log("    hijack_mount(%s, %s, %s) executing...", "/system/bin/hijack", "/dev/block/preinstall", "/preinstall");
+            hijack_log("    hijack_mount(%s, %s, %s) executing...", "/system/bin/hijack", "/dev/block/preinstall", "/preinstall");
             result = hijack_mount("/system/bin/hijack", "/dev/block/preinstall", "/preinstall");
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
             // this will prevent hijack from being called again
-hijack_log("    hijack_umount(%s, %s) executing...", "/system/bin/hijack", "/system");
+            hijack_log("    hijack_umount(%s, %s) executing...", "/system/bin/hijack", "/system");
             result = hijack_umount("/system/bin/hijack", "/system");
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
             char * updater_args[] = { UPDATE_BINARY, "2", "0", RECOVERY_UPDATE_ZIP, NULL };
-hijack_log("    exec(\"%s %s %s %s\") executing...", UPDATE_BINARY, "2", "0", RECOVERY_UPDATE_ZIP);
+            hijack_log("    exec(\"%s %s %s %s\") executing...", UPDATE_BINARY, "2", "0", RECOVERY_UPDATE_ZIP);
             result = exec_and_wait(updater_args);
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
             return result;
 
         } else {
 
-hijack_log("  Boot mode detected!");
+            hijack_log("  Boot mode detected!");
 
 #ifdef LOG_ENABLE
             // since we are in log mode we want to ensure we reboot to recovery in the event of failure
-hijack_log("    mark_file(%s) executing...", RECOVERY_MODE_FILE);
+            hijack_log("    mark_file(%s) executing...", RECOVERY_MODE_FILE);
             result = mark_file(RECOVERY_MODE_FILE);
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 #endif
 
-hijack_log("    remount_root(%s, %d) executing...", "/system/bin/hijack", 1);
+            hijack_log("    remount_root(%s, %d) executing...", "/system/bin/hijack", 1);
             result = remount_root("/system/bin/hijack", 1);
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
-hijack_log("    rename(%s, %s) executing...", "/sbin/adbd", "/sbin/adbd.old");
+            hijack_log("    rename(%s, %s) executing...", "/sbin/adbd", "/sbin/adbd.old");
             result = rename("/sbin/adbd", "/sbin/adbd.old");
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
-hijack_log("    property_set(%s, %s) executing...", "ctl.stop", "runtime");
+            hijack_log("    property_set(%s, %s) executing...", "ctl.stop", "runtime");
             result = property_set("ctl.stop", "runtime");
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
-hijack_log("    property_set(%s, %s) executing...", "ctl.stop", "zygote");
+            hijack_log("    property_set(%s, %s) executing...", "ctl.stop", "zygote");
             result = property_set("ctl.stop", "zygote");
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
-hijack_log("    property_set(%s, %s) executing...", "persist.service.adb.enable", "1");
+            hijack_log("    property_set(%s, %s) executing...", "persist.service.adb.enable", "1");
             result = property_set("persist.service.adb.enable", "1");
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
-hijack_log("    mkdir(%s, %d) executing...", "/newboot", S_IRWXU);
+            hijack_log("    mkdir(%s, %d) executing...", "/newboot", S_IRWXU);
             result = mkdir("/newboot", S_IRWXU);
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
-            // grab our new update-binary from the hijack-boot zip
-            char * unzip_args[] = { "/system/bin/hijack", "unzip", BOOT_UPDATE_ZIP, "META-INF/com/google/android/update-binary", "-d", "/newboot", NULL };
-hijack_log("    exec(%s, %s, %s, %s, %s, %s) executing...", "/system/bin/hijack", "unzip", BOOT_UPDATE_ZIP, "META-INF/com/google/android/update-binary", "-d", "/newboot");
-            result = exec_and_wait(unzip_args);
-hijack_log("      returned: %d", result);
+            hijack_log("    mkdir(%s, %d) executing...", "/preinstall", S_IRWXU);
+            result = mkdir("/preinstall", S_IRWXU);
+            hijack_log("      returned: %d", result);
 
-            // make the binary executable
-hijack_log("    chmod(%s, %d) executing...", "/newboot/META-INF/com/google/android/update-binary", S_IRWXU);
-            result = chmod("/newboot/META-INF/com/google/android/update-binary", S_IRWXU);
-hijack_log("      returned: %d", result);
+            // get access to our preinstall
+            hijack_log("    hijack_mount(%s, %s, %s) executing...", "/system/bin/hijack", "/dev/block/preinstall", "/preinstall");
+            result = hijack_mount("/system/bin/hijack", "/dev/block/preinstall", "/preinstall");
+            hijack_log("      returned: %d", result);
 
             // have updater unpack our boot partition (will create /newboot/sbin/hijack)
-            char * updater_args[] = { "/newboot/META-INF/com/google/android/update-binary", "2", "0", BOOT_UPDATE_ZIP, NULL };
-hijack_log("    exec(\"%s %s %s %s\") executing...", "/newboot/META-INF/com/google/android/update-binary", "2", "0", BOOT_UPDATE_ZIP);
+            char * updater_args[] = { UPDATE_BINARY, "2", "0", BOOT_UPDATE_ZIP, NULL };
+            hijack_log("    exec(\"%s %s %s %s\") executing...", UPDATE_BINARY, "2", "0", BOOT_UPDATE_ZIP);
             result = exec_and_wait(updater_args);
-hijack_log("      returned: %d", result);
-
-            // delete the unnecessary /newboot/META-INF directory
-            char * rm_meta_args[] = { "/newboot/sbin/hijack", "rm", "-rf", "/newboot/META-INF", NULL };
-hijack_log("    exec(\"%s %s %s %s\") executing...", "/newboot/sbin/hijack", "rm", "-rf", "/newboot/META-INF");
-            result = exec_and_wait(rm_meta_args);
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
             // now copy everything to root
             char * copy_args[] = { "/newboot/sbin/hijack", "cp", "-a", "/newboot/.", "/", NULL };
-hijack_log("    exec(\"%s %s %s %s %s\") executing...", "/newboot/sbin/hijack", "cp", "-r", "/newboot/.", "/");
+            hijack_log("    exec(\"%s %s %s %s %s\") executing...", "/newboot/sbin/hijack", "cp", "-r", "/newboot/.", "/");
             result = exec_and_wait(copy_args);
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
             // wipe out /newboot
             char * rm_args[] = { "/sbin/hijack", "rm", "-rf", "/newboot", NULL };
-hijack_log("    exec(\"%s %s %s %s\") executing...", "/sbin/hijack", "rm", "-rf", "/newboot");
+            hijack_log("    exec(\"%s %s %s %s\") executing...", "/sbin/hijack", "rm", "-rf", "/newboot");
             result = exec_and_wait(rm_args);
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
             // since we have /sbin/hijack, we no longer need /system
-hijack_log("    hijack_umount(%s, %s) executing...", "/sbin/hijack", "/system");
+            hijack_log("    hijack_umount(%s, %s) executing...", "/sbin/hijack", "/system");
             result = hijack_umount("/sbin/hijack", "/system");
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
+
+            // now we're done with /preinstall
+            hijack_log("    hijack_umount(%s, %s) executing...", "/sbin/hijack", "/preinstall");
+            result = hijack_umount("/sbin/hijack", "/preinstall");
+            hijack_log("      returned: %d", result);
 
             // now we will attempt to kill EVERYTHING
             char * hijack_killall_args[] = { "/sbin/hijack.killall", NULL };
-hijack_log("    exec(\"%s\")", "/sbin/hijack.killall");
+            hijack_log("    exec(\"%s\")", "/sbin/hijack.killall");
             result = exec_and_wait(hijack_killall_args);
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
 #ifdef LOG_ENABLE
             // one last filesystem accounting run
             char * last_log_dump_args[] = { "/sbin/hijack.log_dump", LOG_PATH, NULL };
-hijack_log("    exec(\"%s %s\") executing...", "/sbin/hijack.log_dump", LOG_PATH);
+            hijack_log("    exec(\"%s %s\") executing...", "/sbin/hijack.log_dump", LOG_PATH);
             result = exec_and_wait(last_log_dump_args);
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 #endif
 
             // now we re-run init (this should restart /init)
             char * init_args[] = { "/sbin/2nd-init", NULL };
-hijack_log("    exec(\"%s\") executing...", "/sbin/2nd-init");
+            hijack_log("    exec(\"%s\") executing...", "/sbin/2nd-init");
             result = exec_and_wait(init_args);
-hijack_log("      returned: %d", result);
+            hijack_log("      returned: %d", result);
 
             return result;
         }

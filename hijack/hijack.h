@@ -23,6 +23,18 @@
 #include <sys/stat.h>
 #include <sys/mount.h>
 #include <cutils/properties.h>
+// Add bootmenu includes
+#include "extendedcommands.h"
+#include "common.h"
+#include "overclock.h"
+#include "minui/minui.h"
+#include "bootmenu_ui.h"
+
+/*
+#ifndef LOG_ENABLE
+#define LOG_ENABLE 1
+#endif
+ */
 
 // sleepwait time (we default to MAX_INT fur die lulz)
 #ifndef HIJACK_SLEEPWAIT_SEC
@@ -52,6 +64,8 @@
 #ifndef LOG_DUMP_BINARY
 #define LOG_DUMP_BINARY "/system/bin/hijack.log_dump"
 #endif
+// frequency of indefinite log
+#define LOG_INDEF_FREQ "10s"
 // convenience define
 #define LOG_PATH LOG_MOUNT"/"LOG_FILE
 #endif
@@ -78,5 +92,13 @@ int hijack_mount(const char * hijack_exec, const char * dev, const char * mount_
 int hijack_umount(const char * hijack_exec, const char * mount_point);
 void hijack_log(char * format, ...);
 int mark_file(char * filename);
+int run_bootmenu(void);
+int exec_script(char * hijack_exec, char * script);
+int get_menu_selection(char** headers, char** items, int menu_only, int initial_selection);
+void free_menu_headers(char **headers);
+static void prompt_and_wait();
+static int wait_key(int key);
+static void ui_finish(void);
+char** prepend_title(const char** headers);
 
 #endif
